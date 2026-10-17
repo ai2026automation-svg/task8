@@ -1,0 +1,6 @@
+{
+  "name": "SmartFin Tasks",
+  "description": "SmartFin CFO Task Management system with MIS Dashboard, Recurring & One-Time Task workflows, and Google Apps Script connectivity.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

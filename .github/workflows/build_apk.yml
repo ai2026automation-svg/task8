@@ -1,0 +1,236 @@
+name: Build Android APK
+
+# SmartFin Tasks (Kotlin + Jetpack Compose, AGP 9.1.1, Gradle 9.3.1)
+#
+# - Debug APK  : har push / pull request / manual run par banta hai.
+# - Release APK: manual run (Run workflow -> build_type = release/both) ya
+#                "v*" tag push (jaise v1.0) par banta hai, aur tag par GitHub Release
+#                me automatically attach ho jata hai.
+#
+# Optional secrets (Settings -> Secrets and variables -> Actions):
+#   KEYSTORE_BASE64  : apni .jks file ka base64 (alias "upload" hona chahiye)
+#   STORE_PASSWORD   : keystore password
+#   KEY_PASSWORD     : key password
+# Agar yeh secrets nahi diye, to release build ek temporary keystore se sign hoga
+# (phone par install ho jayega, lekin Play Store upload / future updates ke liye
+# apni permanent keystore use karo).
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: "Kaunsa APK banana hai?"
+        type: choice
+        default: debug
+        options:
+          - debug
+          - release
+          - both
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false"
+
+jobs:
+  # ---------------------------------------------------------------- DEBUG
+  debug:
+    name: Build Debug APK
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      inputs.build_type == 'debug' || inputs.build_type == 'both'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: temurin
+
+      - name: Set up Gradle (with cache)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Create .env from template
+        run: |
+          if [ ! -f .env ] && [ -f .env.example ]; then
+            cp .env.example .env
+          elif [ ! -f .env ]; then
+            touch .env
+          fi
+
+      - name: Generate debug keystore
+        run: |
+          if [ -f debug.keystore.base64 ]; then
+            base64 -d debug.keystore.base64 > debug.keystore
+          else
+            keytool -genkeypair -v -keystore debug.keystore \
+              -storepass android -alias androiddebugkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Remove duplicate launcher icons (png + webp clash)
+        run: find app/src/main/res -name "ic_launcher*.webp" -delete || true
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Build debug APK
+        run: |
+          set -o pipefail
+          ./gradlew assembleDebug --stacktrace --no-daemon --console=plain 2>&1 | tee build.log
+
+      - name: Show compile errors (only if build failed)
+        if: failure()
+        run: |
+          {
+            echo "### Kotlin / Gradle errors"
+            echo '```'
+            grep -E "^e: |error:|Unresolved|FAILED" build.log | head -60 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "=========== COMPILE ERRORS ==========="
+          grep -E "^e: " build.log || echo "(no 'e:' lines found - see full log above)"
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SmartFin-Tasks-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+  # -------------------------------------------------------------- RELEASE
+  release:
+    name: Build Release APK
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' &&
+       (inputs.build_type == 'release' || inputs.build_type == 'both'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: temurin
+
+      - name: Set up Gradle (with cache)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Create .env from template
+        run: |
+          if [ ! -f .env ] && [ -f .env.example ]; then
+            cp .env.example .env
+          elif [ ! -f .env ]; then
+            touch .env
+          fi
+
+      # app/build.gradle.kts debug build type ke liye bhi debug.keystore maangta hai,
+      # isliye yeh yahan bhi chahiye.
+      - name: Generate debug keystore
+        run: |
+          keytool -genkeypair -keystore debug.keystore \
+            -storepass android -alias androiddebugkey -keypass android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+      # build.gradle.kts release signing in env vars ko padhta hai:
+      # KEYSTORE_PATH, STORE_PASSWORD, KEY_PASSWORD  (key alias = "upload")
+      - name: Prepare release keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          SECRET_STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          SECRET_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "Using keystore from repository secrets."
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            {
+              echo "KEYSTORE_PATH=$RUNNER_TEMP/release.jks"
+              echo "STORE_PASSWORD=$SECRET_STORE_PASSWORD"
+              echo "KEY_PASSWORD=$SECRET_KEY_PASSWORD"
+            } >> "$GITHUB_ENV"
+          else
+            echo "::warning::KEYSTORE_BASE64 secret nahi mila - temporary keystore se sign kar raha hoon. Play Store / future updates ke liye apni permanent keystore use karo."
+            TEMP_PASS="smartfin-temp-pass"
+            keytool -genkeypair -keystore "$RUNNER_TEMP/release.jks" \
+              -storepass "$TEMP_PASS" -alias upload -keypass "$TEMP_PASS" \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=SmartFin Tasks,O=SmartFin,C=IN"
+            {
+              echo "KEYSTORE_PATH=$RUNNER_TEMP/release.jks"
+              echo "STORE_PASSWORD=$TEMP_PASS"
+              echo "KEY_PASSWORD=$TEMP_PASS"
+            } >> "$GITHUB_ENV"
+          fi
+
+      - name: Remove duplicate launcher icons (png + webp clash)
+        run: find app/src/main/res -name "ic_launcher*.webp" -delete || true
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Build signed release APK
+        run: |
+          set -o pipefail
+          ./gradlew assembleRelease --stacktrace --no-daemon --console=plain 2>&1 | tee build.log
+
+      - name: Show compile errors (only if build failed)
+        if: failure()
+        run: |
+          {
+            echo "### Kotlin / Gradle errors"
+            echo '```'
+            grep -E "^e: |error:|Unresolved|FAILED" build.log | head -60 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "=========== COMPILE ERRORS ==========="
+          grep -E "^e: " build.log || echo "(no 'e:' lines found - see full log above)"
+
+      - name: Rename APK
+        run: |
+          mkdir -p dist
+          cp app/build/outputs/apk/release/*.apk "dist/SmartFin-Tasks-${GITHUB_REF_NAME//\//-}-release.apk"
+          ls -lh dist
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SmartFin-Tasks-release-apk
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Attach APK to GitHub Release (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.apk
+          generate_release_notes: true
